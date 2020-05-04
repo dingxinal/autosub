@@ -26,7 +26,7 @@ from googleapiclient.discovery import build
 from progressbar import ProgressBar, Percentage, Bar, ETA
 
 from autosub.constants import (
-    LANGUAGE_CODES, GOOGLE_SPEECH_API_KEY, GOOGLE_SPEECH_API_URL,
+    LANGUAGE_CODES, GOOGLE_SPEECH_API_KEY, GOOGLE_SPEECH_API_URL, AZURE_API_URL, AZURE_SUBSCRIPTION_KEY
 )
 from autosub.formatters import FORMATTERS
 
@@ -65,7 +65,7 @@ class FLACConverter(object): # pylint: disable=too-few-public-methods
             start, end = region
             start = max(0, start - self.include_before)
             end += self.include_after
-            temp = tempfile.NamedTemporaryFile(suffix='.flac', delete=False)
+            temp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
             command = ["ffmpeg", "-ss", str(start), "-t", str(end - start),
                        "-y", "-i", self.source_path,
                        "-loglevel", "error", temp.name]
@@ -84,7 +84,7 @@ class SpeechRecognizer(object): # pylint: disable=too-few-public-methods
     """
     Class for performing speech-to-text for an input FLAC file.
     """
-    def __init__(self, language="en", rate=44100, retries=3, api_key=GOOGLE_SPEECH_API_KEY):
+    def __init__(self, language="en", rate=44100, retries=3, api_key=AZURE_SUBSCRIPTION_KEY):
         self.language = language
         self.rate = rate
         self.api_key = api_key
@@ -93,19 +93,28 @@ class SpeechRecognizer(object): # pylint: disable=too-few-public-methods
     def __call__(self, data):
         try:
             for _ in range(self.retries):
-                url = GOOGLE_SPEECH_API_URL.format(lang=self.language, key=self.api_key)
-                headers = {"Content-Type": "audio/x-flac; rate=%d" % self.rate}
-
+                url = AZURE_API_URL
+                headers = {
+                    'Content-Type': 'audio/wav; codecs=audio/pcm; samplerate=16000',
+                    'Ocp-Apim-Subscription-Key': AZURE_SUBSCRIPTION_KEY,
+                    'Host': 'westus.stt.speech.microsoft.com',
+                }
                 try:
                     resp = requests.post(url, data=data, headers=headers)
                 except requests.exceptions.ConnectionError:
                     continue
 
+                if resp.status_code == 403:
+                    print("Out of credit...")
+                    return None
+
                 for line in resp.content.decode('utf-8').split("\n"):
                     try:
                         line = json.loads(line)
-                        line = line['result'][0]['alternative'][0]['transcript']
-                        return line[:1].upper() + line[1:]
+                        if line['RecognitionStatus'][0] == 'S':
+                            line = line['NBest'][0]['Lexical']
+                            print(line)
+                            return line[:1].upper() + line[1:]
                     except IndexError:
                         # no result
                         continue
@@ -244,17 +253,18 @@ def generate_subtitles( # pylint: disable=too-many-locals,too-many-arguments
     """
     audio_filename, audio_rate = extract_audio(source_path)
 
+    # find the start time and its elapse time of each sentence
     regions = find_speech_regions(audio_filename)
-
+    print("We have {} numbers of regions".format(len(regions)))
     pool = multiprocessing.Pool(concurrency)
     converter = FLACConverter(source_path=audio_filename)
     recognizer = SpeechRecognizer(language=src_language, rate=audio_rate,
-                                  api_key=GOOGLE_SPEECH_API_KEY)
+                                  api_key=AZURE_SUBSCRIPTION_KEY)
 
     transcripts = []
     if regions:
         try:
-            widgets = ["Converting speech regions to FLAC files: ", Percentage(), ' ', Bar(), ' ',
+            widgets = ["Converting speech regions to wav files: ", Percentage(), ' ', Bar(), ' ',
                        ETA()]
             pbar = ProgressBar(widgets=widgets, maxval=len(regions)).start()
             extracted_regions = []
@@ -262,7 +272,6 @@ def generate_subtitles( # pylint: disable=too-many-locals,too-many-arguments
                 extracted_regions.append(extracted_region)
                 pbar.update(i)
             pbar.finish()
-
             widgets = ["Performing speech recognition: ", Percentage(), ' ', Bar(), ' ', ETA()]
             pbar = ProgressBar(widgets=widgets, maxval=len(regions)).start()
 
@@ -314,7 +323,6 @@ def generate_subtitles( # pylint: disable=too-many-locals,too-many-arguments
         output_file.write(formatted_subtitles.encode("utf-8"))
 
     os.remove(audio_filename)
-
     return dest
 
 
